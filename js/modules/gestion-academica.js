@@ -141,6 +141,13 @@
       input.type = field.type || 'text';
       input.value = field.value ?? '';
       if (field.min !== undefined) input.min = field.min;
+      if (field.max !== undefined) input.max = field.max;
+      if (field.readonly) {
+        input.readOnly = true;
+        input.setAttribute('aria-readonly', 'true');
+        input.classList.add('academic-locked-field');
+        input.title = field.title || 'Este valor se establece automáticamente.';
+      }
     }
     const invalid = document.createElement('div');
     invalid.className = 'invalid-feedback';
@@ -155,6 +162,8 @@
     modalBody.classList.toggle('competency-modal-grid', config.layout === 'competency');
     modalHandler = config.save;
     modalSuccessMessage = config.successMessage || null;
+    modalSave.textContent = config.submitLabel || 'Guardar';
+    modalElement.dataset.submitLabel = config.submitLabel || 'Guardar';
     modalForm.classList.remove('was-validated');
     modal.show();
     if (config.onOpen) Promise.resolve(config.onOpen()).catch((error) => { technicalError('No se pudo preparar el formulario.', error); feedback('No se pudo cargar la información.', false); });
@@ -186,7 +195,7 @@
       } else feedback('No se pudo guardar la información.', false);
     } finally {
       modalSave.disabled = false;
-      modalSave.textContent = 'Guardar';
+      modalSave.textContent = modalElement.dataset.submitLabel || 'Guardar';
     }
   });
 
@@ -267,10 +276,23 @@
     const loading = document.querySelector('#academic-year-loading');
     const content = document.querySelector('#academic-year-content');
     const message = document.querySelector('#academic-year-message');
-    loading.classList.remove('d-none'); content.classList.add('d-none'); message.classList.add('d-none');
+    const empty = document.querySelector('#academic-year-empty');
+    const newButton = document.querySelector('#new-school-year-button');
+    const currentYear = new Date().getFullYear();
+    loading.classList.remove('d-none'); content.classList.add('d-none'); empty.classList.add('d-none'); message.classList.add('d-none');
     try {
       await fetchYears();
-      if (!years.length) { message.textContent = 'No hay información disponible.'; message.classList.remove('d-none'); return; }
+      const currentYearExists = years.some((year) => Number(year.anio) === currentYear);
+      newButton.classList.toggle('d-none', currentYearExists);
+      newButton.disabled = currentYearExists;
+      if (!years.length) {
+        const emptyButton = document.querySelector('#create-current-school-year-button');
+        emptyButton.textContent = `+ Crear año escolar ${currentYear}`;
+        emptyButton.onclick = () => schoolYearModal();
+        empty.classList.remove('d-none');
+        refreshAssignmentYear();
+        return;
+      }
       const selector = document.querySelector('#school-year-selector');
       fillSelect(selector, years, 'Seleccione un año escolar', 'anio_escolar_id', (year) => `${year.anio} · ${statusText(year.estado)}`);
       const selected = years.find((year) => String(year.anio_escolar_id) === String(preferredId)) || years.find((year) => year.estado) || years[0];
@@ -312,19 +334,32 @@
   }
 
   function schoolYearModal(year = null) {
+    const currentYear = new Date().getFullYear();
     setMode(year ? 'edit' : 'new');
     openModal({ title: year ? 'Editar año escolar' : 'Nuevo año escolar', fields: [
-      { name: 'anio', label: 'Año', type: 'number', min: 2000, required: true, value: year?.anio },
+      { name: 'anio', label: 'Año escolar', type: 'number', min: 2000, required: true, value: year?.anio ?? currentYear, readonly: !year, title: `PREVI-EDU creará el año escolar ${currentYear}.` },
       { name: 'fecha_inicio', label: 'Fecha de inicio', type: 'date', required: true, value: year?.fecha_inicio },
       { name: 'fecha_fin', label: 'Fecha de fin', type: 'date', required: true, value: year?.fecha_fin },
       { name: 'estado', label: 'Estado', type: 'select', required: true, value: String(year?.estado ?? true), options: [{ value: 'true', label: 'Activo' }, { value: 'false', label: 'Inactivo' }] }
-    ], save: async (values) => {
-      const payload = { anio: Number(values.anio), fecha_inicio: values.fecha_inicio, fecha_fin: values.fecha_fin, estado: values.estado === 'true' };
+    ], submitLabel: year ? 'Guardar cambios' : 'Crear año escolar', successMessage: year ? 'Información actualizada correctamente.' : `Año escolar ${currentYear} creado correctamente.`, save: async (values) => {
+      const selectedYear = Number(values.anio);
+      if (!year && selectedYear !== currentYear) throw userError(`Solo se puede crear el año escolar correspondiente al año actual (${currentYear}).`);
+      const start = values.fecha_inicio || null;
+      const end = values.fecha_fin || null;
+      if (start && Number(start.slice(0, 4)) !== selectedYear) throw userError(`Las fechas deben corresponder al año escolar ${selectedYear}.`);
+      if (end && Number(end.slice(0, 4)) !== selectedYear) throw userError(`Las fechas deben corresponder al año escolar ${selectedYear}.`);
+      if (start && end && end < start) throw userError('La fecha de fin no puede ser anterior a la fecha de inicio.');
+      const payload = { anio: selectedYear, fecha_inicio: start, fecha_fin: end, estado: values.estado === 'true' };
       const instId = year?.institucion_id || await institutionId();
-      if (await exists('anio_escolar', { institucion_id: instId, anio: payload.anio }, year && { key: 'anio_escolar_id', value: year.anio_escolar_id })) throw new Error('El año escolar ya existe.');
+      if (await exists('anio_escolar', { institucion_id: instId, anio: payload.anio }, year && { key: 'anio_escolar_id', value: year.anio_escolar_id })) throw userError(`El año escolar ${payload.anio} ya se encuentra registrado para esta institución.`);
       let saved;
       if (year) saved = data(await db.from('anio_escolar').update(payload).eq('anio_escolar_id', year.anio_escolar_id).select().single(), 'No se pudo actualizar el año.');
       else saved = data(await db.from('anio_escolar').insert({ ...payload, institucion_id: instId }).select().single(), 'No se pudo crear el año.');
+      if (!year && window.appContext?.scope?.yearIds && !window.appContext.scope.yearIds.some((id) => String(id) === String(saved.anio_escolar_id))) {
+        window.appContext.scope.yearIds.push(saved.anio_escolar_id);
+      }
+      window.appContext.currentAcademicYear = saved;
+      window.dispatchEvent(new CustomEvent('previ:academic-year-change', { detail: { academicYear: saved } }));
       await refreshYears(saved.anio_escolar_id);
     }});
   }

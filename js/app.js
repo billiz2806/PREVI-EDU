@@ -10,6 +10,9 @@ if (!sessionData) {
 
   try {
     currentUser = JSON.parse(sessionData);
+    currentUser.activeProfile = currentUser.activeProfile ?? (currentUser.role === 'USUARIO' ? null : currentUser.role);
+    currentUser.availableProfiles = Array.isArray(currentUser.availableProfiles) ? currentUser.availableProfiles : (currentUser.activeProfile ? [currentUser.activeProfile] : []);
+    currentUser.role = currentUser.activeProfile || 'USUARIO';
   } catch {
     sessionStorage.removeItem(SESSION_KEY);
     window.location.replace('login.html');
@@ -17,12 +20,12 @@ if (!sessionData) {
 
   const roleSettings = {
     DIRECTOR: {
-      menu: ['Dashboard', 'Institución', 'Gestión Académica', 'Estudiantes', 'Docentes', 'Asistencia', 'Evaluaciones', 'Alertas', 'Seguimientos', 'Reportes', 'Configuración'],
+      menu: ['Dashboard', 'Institución', 'Gestión Académica', 'Estudiantes', 'Docentes', 'Aulas', 'Asistencia', 'Evaluaciones', 'Alertas', 'Seguimientos', 'Reportes', 'Configuración'],
       title: 'Dashboard Institucional',
       subtitle: 'Resumen general de la institución educativa'
     },
     DOCENTE: {
-      menu: ['Dashboard', 'Mis aulas', 'Mis estudiantes', 'Asistencia', 'Evaluaciones', 'Alertas', 'Seguimientos'],
+      menu: ['Dashboard', 'Aulas', 'Asistencia', 'Evaluaciones', 'Alertas', 'Seguimientos', 'Reportes'],
       title: 'Mi Dashboard',
       subtitle: 'Resumen de mis estudiantes y aulas asignadas'
     },
@@ -36,6 +39,26 @@ if (!sessionData) {
       title: 'Cuenta registrada',
       subtitle: 'Tu cuenta todavía no tiene un perfil funcional asignado.'
     }
+  };
+
+  const menuIcons = {
+    Dashboard: 'layout-dashboard',
+    'Institución': 'building-community',
+    Instituciones: 'building-community',
+    'Gestión Académica': 'books',
+    Estudiantes: 'users',
+    'Mis estudiantes': 'users',
+    Docentes: 'user-screen',
+    Aulas: 'school',
+    'Mis aulas': 'school',
+    Asistencia: 'calendar-check',
+    Evaluaciones: 'clipboard-check',
+    Alertas: 'alert-triangle',
+    Seguimientos: 'list-check',
+    Reportes: 'chart-bar',
+    Configuración: 'settings',
+    Directores: 'user-shield',
+    Usuarios: 'users-group'
   };
 
   const settings = currentUser && roleSettings[currentUser.role];
@@ -53,7 +76,7 @@ if (!sessionData) {
       menuItem.innerHTML = `
         <a class="nav-link${index === 0 ? ' active' : ''}" href="#" aria-label="${item}" title="${item}"${index === 0 ? ' aria-current="page"' : ''}>
           <span class="nav-icon" aria-hidden="true">
-            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"></circle><path d="M9 12h6M12 9v6"></path></svg>
+            <i class="ti ti-${menuIcons[item]}"></i>
           </span>
           <span>${item}</span>
         </a>`;
@@ -68,12 +91,23 @@ if (!sessionData) {
 
     document.querySelector('#logout-button').addEventListener('click', () => {
       window.clearPreviEduContext?.();
+      window.previEduNavigation?.clear();
       window.previEduCurrentUser = null;
+      sessionStorage.removeItem('previEduInstitutionId');
       sessionStorage.removeItem(SESSION_KEY);
       window.location.replace('login.html');
     });
   }
 }
+
+window.previEduNavigation = window.previEduNavigation || (() => {
+  let context = null;
+  return {
+    set(target, values) { context = { target, ...values }; },
+    consume(target) { if (!context || context.target !== target) return null; const value = context; context = null; return value; },
+    clear() { context = null; }
+  };
+})();
 
 const SIDEBAR_STORAGE_KEY = 'previSidebarCollapsed';
 const DESKTOP_MEDIA_QUERY = '(min-width: 992px)';

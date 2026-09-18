@@ -2,7 +2,8 @@
 
 (() => {
   const currentUser = window.previEduCurrentUser;
-  if (!currentUser || currentUser.role !== 'DIRECTOR') return;
+  if (!currentUser || !['DIRECTOR', 'DOCENTE'].includes(currentUser.role)) return;
+  const isTeacher = window.appContext?.currentRole === 'DOCENTE';
 
   const db = window.supabaseClient;
   const menu = document.querySelector('#main-menu');
@@ -11,7 +12,7 @@
   if (!db || !main || !link || !window.ApexCharts || !window.XLSX) return;
 
   const tabs = [
-    ['summary', 'Resumen institucional'],
+    ['summary', isTeacher ? 'Resumen de mis aulas' : 'Resumen institucional'],
     ['attendance', 'Asistencia'],
     ['evaluations', 'Evaluaciones'],
     ['risk', 'Riesgo y alertas'],
@@ -47,7 +48,7 @@
   const filterBox = $('#reports-filters');
   const get = (name) => filterBox.querySelector(`[data-report-filter="${name}"]`);
   const riskOrder = {ALTO:0, MEDIO:1, BAJO:2};
-  const state = {tab:'summary', loaded:false, queried:false, catalogs:{}, institution:null, rows:[], exportRows:[], metrics:[], charts:{}, page:1, size:10, periods:[], activePeriod:null, context:{}};
+  const state = {tab:'summary', loaded:false, queried:false, catalogs:{}, institution:null, rows:[], exportRows:[], metrics:[], charts:{}, page:1, size:10, periods:[], activePeriod:null, context:{}, teacherScope:null, authorizedRoomIds:new Set(), authorizedRoomAreaIds:new Set(), teacherHasClassrooms:true};
 
   function fill(select, rows, placeholder, key, label) {
     select.replaceChildren(new Option(placeholder, ''));
@@ -63,6 +64,10 @@
   function queryContext(extra = {}) { state.context = {year:selectedText('year'), level:selectedText('level'), grade:selectedText('grade'), section:selectedText('room'), ...extra}; }
 
   async function loadCatalogs() {
+    state.teacherScope = isTeacher ? await window.previEduTeacherScope.load() : null;
+    state.authorizedRoomIds = new Set((state.teacherScope?.classrooms || []).map((item) => String(item.classroom.aula_id)));
+    state.authorizedRoomAreaIds = new Set((state.teacherScope?.assignments || []).map((item) => String(item.aula_area_curricular_id)));
+    state.teacherHasClassrooms = !isTeacher || state.authorizedRoomIds.size > 0;
     const responses = await Promise.all([
       db.from('institucion_educativa').select('institucion_id,nombre,codigo_modular,ugel,distrito').eq('institucion_id', window.appContext.currentInstitution.institucion_id).maybeSingle(),
       db.from('anio_escolar').select('anio_escolar_id,institucion_id,anio,estado').eq('institucion_id', window.appContext.currentInstitution.institucion_id).order('anio', {ascending:false}),
@@ -81,15 +86,27 @@
     state.institution = responses[0].data;
     const keys = ['years','levels','grades','sections','rooms','risks','statuses','types','attendanceStatuses','literals','periods'];
     keys.forEach((key, index) => { state.catalogs[key] = check(responses[index + 1], key); });
+    if (isTeacher) {
+      state.catalogs.rooms = state.catalogs.rooms.filter((item) => state.authorizedRoomIds.has(String(item.aula_id)));
+      const yearIds = new Set(state.catalogs.rooms.map((item) => String(item.anio_escolar_id)));
+      const gradeIds = new Set(state.catalogs.rooms.map((item) => String(item.grado_id)));
+      state.catalogs.years = state.catalogs.years.filter((item) => yearIds.has(String(item.anio_escolar_id)));
+      state.catalogs.grades = state.catalogs.grades.filter((item) => gradeIds.has(String(item.grado_id)));
+      const levelIds = new Set(state.catalogs.grades.map((item) => String(item.nivel_id)));
+      state.catalogs.levels = state.catalogs.levels.filter((item) => levelIds.has(String(item.nivel_id)));
+      state.catalogs.periods = state.catalogs.periods.filter((item) => yearIds.has(String(item.anio_escolar_id)));
+    }
     fill(get('year'), state.catalogs.years, 'Seleccione', 'anio_escolar_id', (row) => row.anio);
     fill(get('level'), state.catalogs.levels, 'Todos', 'nivel_id', (row) => row.nombre);
     configureDynamicFilters();
     state.loaded = true;
+    if (isTeacher && !state.teacherHasClassrooms) { $('#reports-initial span').textContent = 'No tienes aulas asignadas en esta institución.'; $('#reports-query').disabled = true; } else $('#reports-query').disabled = false;
   }
 
   function updateGrades() {
     const level = get('level').value;
-    fill(get('grade'), state.catalogs.grades.filter((row) => !level || String(row.nivel_id) === level), 'Todos', 'grado_id', (row) => row.nombre);
+    const year = get('year').value, availableGradeIds = new Set(state.catalogs.rooms.filter((room) => !year || String(room.anio_escolar_id) === year).map((room) => String(room.grado_id)));
+    fill(get('grade'), state.catalogs.grades.filter((row) => (!level || String(row.nivel_id) === level) && (!isTeacher || availableGradeIds.has(String(row.grado_id)))), 'Todos', 'grado_id', (row) => row.nombre);
     get('grade').disabled = !level;
     updateRooms();
   }
@@ -127,11 +144,14 @@
   async function updateAreas() {
     if (state.tab !== 'evaluations' || !get('room')?.value) { if (get('area')) get('area').disabled = true; return; }
     const roomId = Number(get('room').value);
+    if (isTeacher && !state.authorizedRoomIds.has(String(roomId))) { get('area').replaceChildren(new Option('Sin acceso', '')); get('area').disabled = true; return; }
+    let assignmentsQuery = db.from('docente_aula_area').select('aula_area_curricular_id,estado,docente_id,docente(estado,usuario(nombres,apellidos))').eq('estado', true);
+    if (isTeacher) assignmentsQuery = assignmentsQuery.eq('docente_id', window.appContext.currentTeacher.docente_id);
     const [roomAreasResponse, assignmentsResponse] = await Promise.all([
       db.from('aula_area_curricular').select('aula_area_curricular_id,area_curricular_nivel_id,estado,area_curricular_nivel(area_curricular_nivel_id,area_curricular(area_curricular_id,nombre,estado))').eq('aula_id', roomId).eq('estado', true),
-      db.from('docente_aula_area').select('aula_area_curricular_id,estado,docente(estado,usuario(nombres,apellidos))').eq('estado', true)
+      assignmentsQuery
     ]);
-    const roomAreas = check(roomAreasResponse, 'Áreas del aula');
+    const roomAreas = check(roomAreasResponse, 'Áreas del aula').filter((item) => !isTeacher || state.authorizedRoomAreaIds.has(String(item.aula_area_curricular_id)));
     const assignments = check(assignmentsResponse, 'Docentes responsables');
     state.catalogs.currentRoomAreas = roomAreas;
     state.catalogs.currentAssignments = assignments;
@@ -141,7 +161,7 @@
   function filtersChanged(event) {
     const name = event?.target?.dataset.reportFilter;
     if (name === 'level') updateGrades();
-    if (name === 'year') { updateRooms(); updatePeriods(); }
+    if (name === 'year') { updateGrades(); updatePeriods(); }
     if (name === 'grade') updateRooms();
     if (name === 'room') updateAreas().catch(reportError);
     if (state.queried) invalidate('Los filtros cambiaron. Presione Consultar para actualizar el reporte.');
@@ -156,7 +176,9 @@
   function clearFilters() {
     [...filterBox.querySelectorAll('select,input')].forEach((element) => { element.value = ''; });
     get('grade').disabled = true; get('room').disabled = true;
-    configureDynamicFilters(); invalidate(); feedback('');
+    configureDynamicFilters();
+    invalidate(isTeacher && !state.teacherHasClassrooms ? 'No tienes aulas asignadas en esta institución.' : 'Seleccione los filtros y presione Consultar.');
+    feedback('');
   }
   function required() {
     const values = filterValues();
@@ -165,8 +187,19 @@
     if (state.tab === 'evaluations' && (!values.level || !values.grade || !values.room || !values.area || !values.period)) return 'Seleccione año, nivel, grado, sección, área y bimestre.';
     return '';
   }
+  function scopeValidation() {
+    if (!isTeacher) return '';
+    if (!state.teacherHasClassrooms) return 'No tienes aulas asignadas en esta institución.';
+    const values = filterValues();
+    if (values.year && !state.catalogs.years.some((item) => String(item.anio_escolar_id) === String(values.year))) return 'No tienes acceso para consultar información de este año escolar.';
+    if (values.room && !state.authorizedRoomIds.has(String(values.room))) return 'No tienes acceso para consultar información de esta aula.';
+    if (state.tab === 'evaluations' && values.area && !state.authorizedRoomAreaIds.has(String(values.area))) return 'No tienes asignada esta área curricular en el aula seleccionada.';
+    if (state.tab === 'evaluations' && values.area && !state.catalogs.currentRoomAreas?.some((item) => String(item.aula_area_curricular_id) === String(values.area))) return 'No tienes asignada esta área curricular en el aula seleccionada.';
+    return '';
+  }
 
   async function queryReport() {
+    const authorization = scopeValidation(); if (authorization) { feedback(authorization, false); return; }
     const validation = required(); if (validation) { feedback(validation, false); return; }
     const button = $('#reports-query'); button.disabled = true; button.textContent = 'Consultando...';
     $('#reports-loading').classList.remove('d-none'); $('#reports-initial').classList.add('d-none'); $('#reports-results').classList.add('d-none'); feedback('');
@@ -177,7 +210,8 @@
       if (state.tab === 'risk') await queryRisk();
       if (state.tab === 'followups') await queryFollowups();
       state.queried = true; state.page = 1; renderPage(); updatePrintHeader();
-      const hasResults = state.tab === 'summary' ? state.metrics.length > 0 : state.tab === 'evaluations' ? Boolean(state.context.enrollments?.length && state.context.competencies?.length) : state.rows.length > 0;
+      const hasResults = state.tab === 'summary' ? Boolean(state.context.enrollments?.length) : state.tab === 'evaluations' ? Boolean(state.context.enrollments?.length && state.context.competencies?.length) : state.rows.length > 0;
+      $('#reports-empty').textContent = isTeacher && !state.teacherHasClassrooms ? 'No tienes aulas asignadas en esta institución.' : 'No se encontraron datos para generar este reporte.';
       $('#reports-results').classList.remove('d-none'); $('#reports-actions').classList.toggle('d-none', !hasResults); $('#reports-generated').textContent = `Generado: ${generated()}`;
     } catch (error) { console.error('[Reportes]', error.cause || error); invalidate(); feedback('No fue posible generar el reporte.', false); }
     finally { button.disabled = false; button.textContent = 'Consultar'; $('#reports-loading').classList.add('d-none'); }
@@ -185,14 +219,15 @@
 
   function enrollmentQuery() {
     let query = db.from('matricula').select('matricula_id,estado,estudiante(estudiante_id,codigo,nombres,apellido_paterno,apellido_materno),aula!inner(aula_id,anio_escolar_id,grado_id,seccion_id,anio_escolar(anio_escolar_id,anio),grado!inner(grado_id,nivel_id,nombre,nivel_educativo(nivel_id,nombre)),seccion(seccion_id,nombre))').eq('estado', true).eq('aula.anio_escolar_id', Number(get('year').value));
+    if (isTeacher) query = query.in('aula_id', [...state.authorizedRoomIds].map(Number));
     if (get('level').value) query = query.eq('aula.grado.nivel_id', Number(get('level').value));
     if (get('grade').value) query = query.eq('aula.grado_id', Number(get('grade').value));
     if (get('room').value) query = query.eq('aula_id', Number(get('room').value));
     return query;
   }
-  async function baseEnrollments() { return check(await enrollmentQuery(), 'Matrículas'); }
+  async function baseEnrollments() { if (isTeacher && !state.authorizedRoomIds.size) return []; return check(await enrollmentQuery(), 'Matrículas'); }
   async function rowsByEnrollment(table, select, enrollmentIds, configure = (query) => query) { if (!enrollmentIds.length) return []; return check(await configure(db.from(table).select(select).in('matricula_id', enrollmentIds)), table); }
-  function attendanceSummary(rows) { const count = {A:0,T:0,FJ:0,FNJ:0}; rows.forEach((row) => { const code = rel(row.estado_asistencia)?.codigo; if (Object.hasOwn(count, code)) count[code] += 1; }); return {...count, total:rows.length, percent:rows.length ? count.A / rows.length * 100 : null}; }
+  function attendanceSummary(rows) { const count = {A:0,U:0,T:0,FJ:0,FNJ:0}; rows.forEach((row) => { const code = rel(row.estado_asistencia)?.codigo; if (Object.hasOwn(count, code)) count[code] += 1; }); return {...count, total:rows.length, percent:rows.length ? (count.A + count.U) / rows.length * 100 : null}; }
   function studentsAttendance(enrollments, rows) { return enrollments.map((enrollment) => { const own = rows.filter((row) => row.matricula_id === enrollment.matricula_id); return {parts:academicParts(enrollment), summary:attendanceSummary(own)}; }); }
 
   async function querySummary() {
@@ -302,11 +337,12 @@
   function renderAttendanceChart(total) { clearCharts(); $('#reports-charts').innerHTML = '<div class="attendance-legend report-attendance-legend"><i class="ti ti-info-circle"></i><strong>Leyenda:</strong><span><b class="attendance-status attendance-status-a">A</b> Asistencia</span><span><b class="attendance-status attendance-status-t">T</b> Tardanza</span><span><b class="attendance-status attendance-status-fj">FJ</b> Falta justificada</span><span><b class="attendance-status attendance-status-fnj">FNJ</b> Falta no justificada</span></div><article class="card students-card report-single-chart"><div class="card-header"><h2 class="card-title">Distribución de estados</h2></div><div class="card-body report-chart" id="report-attendance-status-chart"></div></article>'; chart('#report-attendance-status-chart',{chart:{type:'bar',height:190,toolbar:{show:false}},series:[{name:'Registros',data:[total.A,total.T,total.FJ,total.FNJ]}],xaxis:{categories:['A','T','FJ','FNJ']},colors:['#55ad83','#e9ad47','#45afd0','#e9786a'],plotOptions:{bar:{distributed:true,borderRadius:5}},legend:{show:false},dataLabels:{enabled:false}}); }
   function renderEvaluationChart(counts) { $('#reports-charts').innerHTML = '<article class="card students-card report-evaluation-chart"><div class="card-header"><h2 class="card-title">Distribución de calificaciones literales</h2></div><div class="card-body" id="report-evaluation-chart"></div></article>'; chart('#report-evaluation-chart',{chart:{type:'bar',height:175,toolbar:{show:false}},series:[{name:'Calificaciones',data:[counts.AD,counts.A,counts.B,counts.C]}],xaxis:{categories:['AD','A','B','C']},colors:['#568bd4','#55ad83','#e9ad47','#e9786a'],plotOptions:{bar:{distributed:true,borderRadius:5}},legend:{show:false},dataLabels:{enabled:false}}); }
 
-  function updatePrintHeader() { const title = tabs.find(([key]) => key === state.tab)?.[1] || 'Reporte'; $('#reports-print-title').textContent = title; $('#reports-print-institution').textContent = `${safe(state.institution?.nombre)} · Código modular: ${safe(state.institution?.codigo_modular)} · UGEL: ${safe(state.institution?.ugel)} · Distrito: ${safe(state.institution?.distrito)}`; $('#reports-print-meta').textContent = `Año: ${state.context.year || '—'} · Nivel: ${state.context.level || 'Todos'} · Grado: ${state.context.grade || 'Todos'} · Sección: ${state.context.section || 'Todas'} · Generado: ${generated()}`; }
-  function excelHeader(extra = []) { return [['PREVI-EDU'],['Institución',safe(state.institution?.nombre)],['Código modular',safe(state.institution?.codigo_modular)],['UGEL',safe(state.institution?.ugel)],['Distrito',safe(state.institution?.distrito)],['Año escolar',state.context.year],['Nivel',state.context.level],['Grado',state.context.grade],['Sección',state.context.section],...extra,['Fecha de generación',generated()],[]]; }
+  function updatePrintHeader() { const title = tabs.find(([key]) => key === state.tab)?.[1] || 'Reporte', teacher = isTeacher ? ` · Docente: ${[window.appContext.currentUser?.nombres, window.appContext.currentUser?.apellidos].filter(Boolean).join(' ')}` : ''; $('#reports-print-title').textContent = title; $('#reports-print-institution').textContent = `${safe(state.institution?.nombre)} · Código modular: ${safe(state.institution?.codigo_modular)} · UGEL: ${safe(state.institution?.ugel)} · Distrito: ${safe(state.institution?.distrito)}`; $('#reports-print-meta').textContent = `Año: ${state.context.year || '—'} · Nivel: ${state.context.level || 'Todos'} · Grado: ${state.context.grade || 'Todos'} · Sección: ${state.context.section || 'Todas'}${teacher} · Generado: ${generated()}`; }
+  function excelHeader(extra = []) { const teacher = isTeacher ? [['Docente',[window.appContext.currentUser?.nombres,window.appContext.currentUser?.apellidos].filter(Boolean).join(' ')]] : []; return [['PREVI-EDU'],['Institución',safe(state.institution?.nombre)],['Código modular',safe(state.institution?.codigo_modular)],['UGEL',safe(state.institution?.ugel)],['Distrito',safe(state.institution?.distrito)],...teacher,['Año escolar',state.context.year],['Nivel',state.context.level],['Grado',state.context.grade],['Sección',state.context.section],...extra,['Fecha de generación',generated()],[]]; }
   function appendSheet(workbook, name, rows) { const sheet = XLSX.utils.aoa_to_sheet(rows); const width = Math.max(...rows.map((row) => row.length)); sheet['!cols'] = Array.from({length:width},(_,index)=>({wch:Math.min(48,Math.max(12,...rows.map((row)=>safe(row[index],'').length+2)))})); XLSX.utils.book_append_sheet(workbook,sheet,safe(name,'Reporte').slice(0,31).replace(/[\\/?*\[\]:]/g,'-')); }
   function exportExcel() {
     if (!state.queried) return; feedback('Preparando archivo...');
+    const authorization = scopeValidation(); if (authorization) { feedback(authorization, false); return; }
     try {
       const workbook = XLSX.utils.book_new(), year = state.context.year || 'Año', fileParts = ['PREVI-EDU',tabs.find(([key])=>key===state.tab)[1],year];
       if (state.tab === 'summary') { const body = state.rows.map((row) => { const enrollment=state.context.enrollments.find((item)=>item.matricula_id===row.matricula_id),p=academicParts(enrollment),alert=row.alerta?.[0],factor=row.factor_analisis_riesgo?.[0];return[p.student?.codigo,fullName(p.student),p.level?.nombre,p.grade?.nombre,p.section?.nombre,rel(row.nivel_riesgo)?.codigo,rel(alert?.estado_alerta)?.codigo,factor?.descripcion||factor?.valor||factor?.tipo_factor];}); appendSheet(workbook,'Resumen',[...excelHeader(),...state.metrics.map(([a,b])=>[a,b]),[],['Código','Estudiante','Nivel','Grado','Sección','Nivel riesgo','Estado alerta','Factor principal'],...body]); }
@@ -319,12 +355,14 @@
   }
   function feedback(message, ok = true) { const element = $('#reports-feedback'); if (!message) { element.classList.add('d-none'); return; } element.textContent = message; element.className = `alert students-feedback reports-no-print ${ok ? 'alert-success' : 'alert-danger'}`; }
   function reportError(error) { console.error('[Reportes]',error.cause||error); feedback('No fue posible generar el reporte.',false); }
+  function printReport() { if (!state.queried) return; const authorization = scopeValidation(); if (authorization) { feedback(authorization, false); return; } window.print(); }
   function activate(tab) { state.tab = tab; document.querySelectorAll('[data-reports-tab]').forEach((button)=>button.classList.toggle('active',button.dataset.reportsTab===tab));configureDynamicFilters();clearFilters(); }
-  function show(event) { event.preventDefault(); ['#dashboard-director','#institution-view','#academic-management-view','#students-view','#teachers-view','#attendance-view','#evaluations-view','#alerts-view','#followups-view'].forEach((selector)=>$(selector)?.classList.add('d-none'));$('#reports-view').classList.remove('d-none');$('#dashboard-title').textContent='REPORTES';$('#dashboard-subtitle').textContent='Consulte y exporte información institucional para el seguimiento académico y preventivo.';menu.querySelectorAll('.nav-link').forEach((item)=>item.classList.toggle('active',item===link));if(!state.loaded)init();else invalidate(); }
-  async function init() { try { $('#reports-loading').classList.remove('d-none'); await loadCatalogs(); invalidate(); } catch(error) { reportError(error); } finally { $('#reports-loading').classList.add('d-none'); } }
+  function show(event) { event.preventDefault(); ['#dashboard-director','#dashboard-teacher','#institution-view','#academic-management-view','#students-view','#teachers-view','#classrooms-view','#teacher-classrooms-view','#attendance-view','#evaluations-view','#alerts-view','#followups-view'].forEach((selector)=>$(selector)?.classList.add('d-none'));$('#reports-view').classList.remove('d-none');$('#dashboard-title').textContent='REPORTES';$('#dashboard-subtitle').textContent=isTeacher?'Consulta y analiza la información académica de tus aulas asignadas.':'Consulte y exporte información institucional para el seguimiento académico y preventivo.';menu.querySelectorAll('.nav-link').forEach((item)=>item.classList.toggle('active',item===link));if(!state.loaded)init();else invalidate(isTeacher && !state.teacherHasClassrooms ? 'No tienes aulas asignadas en esta institución.' : 'Seleccione los filtros y presione Consultar.'); }
+  async function init() { try { $('#reports-loading').classList.remove('d-none'); await loadCatalogs(); invalidate(isTeacher && !state.teacherHasClassrooms ? 'No tienes aulas asignadas en esta institución.' : 'Seleccione los filtros y presione Consultar.'); } catch(error) { reportError(error); } finally { $('#reports-loading').classList.add('d-none'); } }
 
   get('level').addEventListener('change', filtersChanged); get('grade').addEventListener('change', filtersChanged); get('year').addEventListener('change', filtersChanged); get('room').addEventListener('change', filtersChanged);
   link.addEventListener('click',show); [...menu.querySelectorAll('.nav-link')].filter((item)=>item!==link).forEach((item)=>item.addEventListener('click',()=>$('#reports-view').classList.add('d-none')));
   document.querySelectorAll('[data-reports-tab]').forEach((button)=>button.addEventListener('click',()=>activate(button.dataset.reportsTab)));
-  $('#reports-query').addEventListener('click',queryReport); $('#reports-clear').addEventListener('click',clearFilters); $('#reports-export').addEventListener('click',exportExcel); $('#reports-print').addEventListener('click',()=>window.print());
+  $('#reports-query').addEventListener('click',queryReport); $('#reports-clear').addEventListener('click',clearFilters); $('#reports-export').addEventListener('click',exportExcel); $('#reports-print').addEventListener('click',printReport);
+  if(isTeacher)window.addEventListener('previ:institution-change',async()=>{state.loaded=false;state.queried=false;state.teacherScope=null;state.authorizedRoomIds.clear();state.authorizedRoomAreaIds.clear();state.catalogs={};state.rows=[];state.exportRows=[];state.metrics=[];state.context={};state.periods=[];state.activePeriod=null;destroyCharts();invalidate('Seleccione los filtros y presione Consultar.');feedback('');if(!$('#reports-view').classList.contains('d-none'))await init();});
 })();

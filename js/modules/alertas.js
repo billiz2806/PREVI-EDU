@@ -2,7 +2,8 @@
 
 (() => {
   const sessionUser = window.previEduCurrentUser;
-  if (!sessionUser || sessionUser.role !== 'DIRECTOR') return;
+  if (!sessionUser || !['DIRECTOR', 'DOCENTE'].includes(sessionUser.role)) return;
+  const isTeacher = window.appContext?.currentRole === 'DOCENTE';
   const db = window.supabaseClient;
   const menu = document.querySelector('#main-menu');
   const view = document.querySelector('#alerts-view');
@@ -11,7 +12,7 @@
 
   const title = document.querySelector('#dashboard-title'); const subtitle = document.querySelector('#dashboard-subtitle'); const tabs = [...document.querySelectorAll('[data-alerts-tab]')];
   const analysisModal = new window.tabler.Modal(document.querySelector('#risk-analysis-modal')); const detailModal = new window.tabler.Modal(document.querySelector('#alert-detail-modal')); const followupModal = new window.tabler.Modal(document.querySelector('#follow-up-modal'));
-  const state = { analyses: [], alerts: [], years: [], levels: [], grades: [], sections: [], classrooms: [], risks: [], alertStates: [], followupTypes: [], directorId: null, selectedAnalysis: null, selectedAlert: null, loaded: false, earlyPage: 1, closedPage: 1, pageSize: 10 };
+  const state = { analyses: [], alerts: [], years: [], levels: [], grades: [], sections: [], classrooms: [], risks: [], alertStates: [], followupTypes: [], directorId: null, responsibleId: null, authorizedEnrollmentIds: new Set(), authorizedAlertIds: new Set(), teacherHasClassrooms: true, teacherHasStudents: true, selectedAnalysis: null, selectedAlert: null, loaded: false, earlyPage: 1, closedPage: 1, pageSize: 10 };
   const relation = (item) => Array.isArray(item) ? item[0] : item;
   const value = (item, fallback = 'No registrado') => item === null || item === undefined || item === '' ? fallback : String(item);
   const normalize = (item) => value(item, '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
@@ -23,12 +24,15 @@
   const analysisParts = (analysis) => { const enrollment = relation(analysis?.matricula); const student = relation(enrollment?.estudiante); const classroom = relation(enrollment?.aula); const grade = relation(classroom?.grado); const level = relation(grade?.nivel_educativo); const section = relation(classroom?.seccion); const year = relation(classroom?.anio_escolar); const risk = relation(analysis?.nivel_riesgo); return { enrollment, student, classroom, grade, level, section, year, risk }; };
   const alertState = (alert) => relation(alert?.estado_alerta)?.codigo || 'SIN ALERTA';
   const riskPriority = { ALTO: 0, MEDIO: 1, BAJO: 2 };
+  const authorizedAnalysis = (analysis) => !isTeacher || state.authorizedEnrollmentIds.has(String(analysis?.matricula_id));
+  const authorizedAlert = (alert) => !isTeacher || (state.authorizedAlertIds.has(String(alert?.alerta_id)) && authorizedAnalysis(alert?.analysis || state.analyses.find((item) => (item.alerta || []).some((candidate) => candidate.alerta_id === alert?.alerta_id))));
+  function denyAccess() { feedback('No tienes acceso a la información de este estudiante.', false); }
 
   function feedback(message, success = true) { const element = document.querySelector('#alerts-feedback'); element.textContent = message; element.className = `alert students-feedback ${success ? 'alert-success' : 'alert-danger'}`; element.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
   function riskBadge(code) { return `<span class="badge alert-risk risk-${normalize(code)}">${escapeHtml(code || 'Sin información')}</span>`; }
   function statusBadge(code) { return `<span class="badge alert-state state-${normalize(code)}">${escapeHtml(code || 'Sin alerta')}</span>`; }
   function setActiveMenu(active) { menu.querySelectorAll('.nav-link').forEach((link) => { link.classList.toggle('active', link === active); if (link === active) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current'); }); }
-  function showAlerts(event) { event.preventDefault();['#dashboard-director', '#institution-view', '#academic-management-view', '#students-view', '#teachers-view'].forEach((selector) => document.querySelector(selector)?.classList.add('d-none')); view.classList.remove('d-none'); title.textContent = 'ALERTAS'; subtitle.textContent = 'Análisis preventivo y seguimiento de alertas tempranas'; setActiveMenu(alertLink); activateTab('analysis'); if (!state.loaded) initialize(); }
+  async function showAlerts(event) { event.preventDefault();['#dashboard-director', '#dashboard-teacher', '#institution-view', '#academic-management-view', '#students-view', '#teachers-view', '#classrooms-view', '#teacher-classrooms-view', '#attendance-view', '#evaluations-view', '#followups-view'].forEach((selector) => document.querySelector(selector)?.classList.add('d-none')); view.classList.remove('d-none'); title.textContent = 'ALERTAS'; subtitle.textContent = isTeacher ? 'Alertas preventivas de estudiantes pertenecientes a tus aulas.' : 'Análisis preventivo y seguimiento de alertas tempranas'; setActiveMenu(alertLink); activateTab('analysis'); if (!state.loaded) await initialize(); const context = window.previEduNavigation?.consume('alerts'); if (context?.alertaId) { const alert = state.alerts.find((item) => Number(item.alerta_id) === Number(context.alertaId)); if (alert) openAlertDetail(alert); else feedback('No tienes acceso a la información de este estudiante.', false); } }
   function hideAlerts() { view.classList.add('d-none'); }
   function activateTab(name) { tabs.forEach((tab) => { const active = tab.dataset.alertsTab === name; tab.classList.toggle('active', active); tab.setAttribute('aria-selected', String(active)); }); document.querySelectorAll('.alerts-pane').forEach((pane) => pane.classList.toggle('d-none', pane.id !== `alerts-pane-${name}`)); }
   function fill(select, rows, placeholder, key, label) { select.replaceChildren(new Option(placeholder, '')); rows.forEach((row) => select.add(new Option(label(row), row[key]))); select.disabled = false; }
@@ -45,8 +49,14 @@
   */
   async function loadData() {
     const analysisSelect = 'analisis_riesgo_id,matricula_id,periodo_id,nivel_riesgo_id,fecha_analisis,descripcion,nivel_riesgo(nivel_riesgo_id,codigo,nombre),factor_analisis_riesgo(tipo_factor,descripcion,valor),matricula(matricula_id,estudiante(estudiante_id,codigo,nombres,apellido_paterno,apellido_materno),aula(aula_id,anio_escolar_id,grado_id,seccion_id,anio_escolar(anio_escolar_id,anio),grado(grado_id,nivel_id,nombre,nivel_educativo(nivel_id,nombre)),seccion(seccion_id,nombre))),alerta(alerta_id,estado_alerta_id,titulo,descripcion,fecha_generacion,fecha_cierre,fecha_actualizacion,estado_alerta(estado_alerta_id,codigo,nombre),seguimiento(seguimiento_id,fecha,descripcion,tipo_seguimiento(nombre),usuario(nombres,apellidos)))';
+    const teacherScope = isTeacher ? await window.previEduTeacherScope.load() : null;
+    const enrollmentIds = isTeacher ? teacherScope.enrollments.map((item) => item.matricula_id) : window.appContext.scope.enrollmentIds;
+    const classroomIds = isTeacher ? new Set(teacherScope.classrooms.map((item) => String(item.classroom.aula_id))) : null;
+    state.authorizedEnrollmentIds = new Set(enrollmentIds.map(String));
+    state.teacherHasClassrooms = !isTeacher || teacherScope.classrooms.length > 0;
+    state.teacherHasStudents = !isTeacher || enrollmentIds.length > 0;
     const responses = await Promise.all([
-      db.from('analisis_riesgo').select(analysisSelect).in('matricula_id', window.appContext.scope.enrollmentIds).order('fecha_analisis', { ascending: false }),
+      enrollmentIds.length ? db.from('analisis_riesgo').select(analysisSelect).in('matricula_id', enrollmentIds).order('fecha_analisis', { ascending: false }) : Promise.resolve({ data: [], error: null }),
       db.from('anio_escolar').select('anio_escolar_id,anio,estado').eq('institucion_id', window.appContext.currentInstitution.institucion_id).order('anio', { ascending: false }),
       db.from('nivel_educativo').select('nivel_id,nombre,estado').order('nombre'),
       db.from('grado').select('grado_id,nivel_id,nombre,orden,estado').order('orden'),
@@ -55,19 +65,29 @@
       db.from('nivel_riesgo').select('nivel_riesgo_id,codigo,nombre,estado').order('orden'),
       db.from('estado_alerta').select('estado_alerta_id,codigo,nombre,estado').order('orden'),
       db.from('tipo_seguimiento').select('tipo_seguimiento_id,codigo,nombre,estado').eq('estado', true).order('nombre'),
-      db.from('usuario').select('usuario_id').eq('nombre_usuario', sessionUser.username).eq('rol', 'DIRECTOR').maybeSingle()
+      db.from('usuario').select('usuario_id').eq('nombre_usuario', sessionUser.username).maybeSingle()
     ]);
     state.analyses = data(responses[0], 'No se pudieron consultar los análisis.') || [];
     state.years = data(responses[1], 'No se pudieron consultar los años.') || [];
     state.levels = data(responses[2], 'No se pudieron consultar los niveles.') || [];
     state.grades = data(responses[3], 'No se pudieron consultar los grados.') || [];
     state.sections = data(responses[4], 'No se pudieron consultar las secciones.') || [];
-    state.classrooms = data(responses[5], 'No se pudieron consultar las aulas.') || [];
+    state.classrooms = (data(responses[5], 'No se pudieron consultar las aulas.') || []).filter((item) => !isTeacher || classroomIds.has(String(item.aula_id)));
     state.risks = data(responses[6], 'No se pudieron consultar los niveles de riesgo.') || [];
     state.alertStates = data(responses[7], 'No se pudieron consultar los estados de alerta.') || [];
     state.followupTypes = data(responses[8], 'No se pudieron consultar los tipos de seguimiento.') || [];
-    state.directorId = data(responses[9], 'No se pudo resolver el usuario Director.')?.usuario_id || null;
+    state.responsibleId = data(responses[9], 'No se pudo resolver el usuario responsable.')?.usuario_id || null;
+    state.directorId = state.responsibleId;
     state.alerts = state.analyses.flatMap((analysis) => (analysis.alerta || []).map((alert) => ({ ...alert, analysis })));
+    state.authorizedAlertIds = new Set(state.alerts.map((item) => String(item.alerta_id)));
+    if (isTeacher) {
+      const yearIds = new Set(state.classrooms.map((item) => String(item.anio_escolar_id)));
+      const gradeIds = new Set(state.classrooms.map((item) => String(item.grado_id)));
+      state.years = state.years.filter((item) => yearIds.has(String(item.anio_escolar_id)));
+      state.grades = state.grades.filter((item) => gradeIds.has(String(item.grado_id)));
+      const levelIds = new Set(state.grades.map((item) => String(item.nivel_id)));
+      state.levels = state.levels.filter((item) => levelIds.has(String(item.nivel_id)));
+    }
   }
 
   function initializeFilters(container, alertMode = false) {
@@ -77,6 +97,7 @@
     container.querySelector('[data-filter="level"]').addEventListener('change', () => { const levelId = container.querySelector('[data-filter="level"]').value; const grade = container.querySelector('[data-filter="grade"]'); fill(grade, state.grades.filter((row) => !levelId || String(row.nivel_id) === levelId), 'Todos', 'grado_id', (row) => row.nombre); grade.disabled = !levelId; updateClassrooms(container); rerender(); });
     container.querySelector('[data-filter="grade"]').addEventListener('change', () => { updateClassrooms(container); rerender(); }); container.querySelector('[data-filter="year"]').addEventListener('change', () => { updateClassrooms(container); rerender(); });
   }
+  function resetFilterOptions(container, alertMode = false) { fill(container.querySelector('[data-filter="year"]'), state.years, 'Todos', 'anio_escolar_id', (row) => row.anio); fill(container.querySelector('[data-filter="level"]'), state.levels, 'Todos', 'nivel_id', (row) => row.nombre); fill(container.querySelector('[data-filter="risk"]'), state.risks, 'Todos', 'codigo', (row) => row.nombre); fill(container.querySelector('[data-filter="grade"]'), [], 'Todos', 'grado_id', (row) => row.nombre); fill(container.querySelector('[data-filter="classroom"]'), [], 'Todas', 'aula_id', (row) => row.aula_id); container.querySelector('[data-filter="grade"]').disabled = true; container.querySelector('[data-filter="classroom"]').disabled = true; if (alertMode) fill(container.querySelector('[data-filter="status"]'), state.alertStates.filter((row) => ['NUEVA', 'SEGUIMIENTO'].includes(row.codigo)), 'Todos', 'codigo', (row) => row.nombre); container.querySelectorAll('input').forEach((input) => { input.value = ''; }); }
   function updateClassrooms(container) { const year = container.querySelector('[data-filter="year"]').value; const grade = container.querySelector('[data-filter="grade"]').value; const select = container.querySelector('[data-filter="classroom"]'); const rows = state.classrooms.filter((row) => (!year || String(row.anio_escolar_id) === year) && (!grade || String(row.grado_id) === grade)); fill(select, rows, 'Todas', 'aula_id', (row) => state.sections.find((section) => section.seccion_id === row.seccion_id)?.nombre || 'Aula'); select.disabled = !grade; }
   function matchesFilters(analysis, container) { const part = analysisParts(analysis); const get = (name) => container.querySelector(`[data-filter="${name}"]`)?.value || ''; const search = normalize(get('search')); return (!get('year') || String(part.year?.anio_escolar_id) === get('year')) && (!get('level') || String(part.level?.nivel_id) === get('level')) && (!get('grade') || String(part.grade?.grado_id) === get('grade')) && (!get('classroom') || String(part.classroom?.aula_id) === get('classroom')) && (!get('risk') || part.risk?.codigo === get('risk')) && (!search || normalize(`${part.student?.codigo} ${fullName(part.student)}`).includes(search)); }
 
@@ -99,8 +120,18 @@
   function openFollowup(alert = state.selectedAlert) { if (!alert) return; state.selectedAlert = alert; const form = document.querySelector('#follow-up-form'); form.reset(); form.classList.remove('was-validated'); fill(form.elements.tipo_seguimiento_id, state.followupTypes, 'Seleccione un tipo', 'tipo_seguimiento_id', (item) => item.nombre); form.elements.fecha.value = new Date().toISOString().slice(0, 10); followupModal.show(); }
   async function saveFollowup(event) { event.preventDefault(); const form = event.currentTarget; if (!form.checkValidity()) { form.classList.add('was-validated'); return; } if (!state.directorId || !state.selectedAlert) { feedback('No se pudo identificar el usuario responsable.', false); return; } const values = new FormData(form); const submit = form.querySelector('[type="submit"]'); submit.disabled = true; submit.textContent = 'Guardando seguimiento...'; try { data(await db.from('seguimiento').insert({ alerta_id: state.selectedAlert.alerta_id, usuario_id: state.directorId, tipo_seguimiento_id: Number(values.get('tipo_seguimiento_id')), fecha: values.get('fecha'), descripcion: values.get('descripcion').trim(), acuerdo: values.get('acuerdo').trim() || null, proxima_accion: values.get('proxima_accion').trim() || null, fecha_proxima_accion: values.get('fecha_proxima_accion') || null, fecha_registro: new Date().toISOString() }), 'No se pudo registrar el seguimiento.'); if (alertState(state.selectedAlert) === 'NUEVA') { const followState = state.alertStates.find((item) => item.codigo === 'SEGUIMIENTO'); data(await db.from('alerta').update({ estado_alerta_id: followState.estado_alerta_id, fecha_actualizacion: new Date().toISOString() }).eq('alerta_id', state.selectedAlert.alerta_id), 'No se pudo actualizar la alerta.'); } followupModal.hide(); feedback('Seguimiento registrado correctamente.'); await refresh(); } catch (error) { logError('Error al registrar seguimiento.', error); feedback('No se pudo guardar la información.', false); } finally { submit.disabled = false; submit.textContent = 'Guardar seguimiento'; } }
   async function closeAlert() { if (!state.selectedAlert || !window.confirm('¿Desea cerrar esta alerta?')) return; try { const closed = state.alertStates.find((item) => item.codigo === 'CERRADA'); const now = new Date().toISOString(); data(await db.from('alerta').update({ estado_alerta_id: closed.estado_alerta_id, fecha_cierre: now, fecha_actualizacion: now }).eq('alerta_id', state.selectedAlert.alerta_id), 'No se pudo cerrar la alerta.'); detailModal.hide(); feedback('Alerta cerrada correctamente.'); await refresh(); } catch (error) { logError('Error al cerrar alerta.', error); feedback('No se pudo guardar la información.', false); } }
-  async function refresh() { await loadData(); renderIndicators(); renderAnalyses(); renderEarlyAlerts(); renderClosedAlerts(); }
+  function updateEmptyCopy() { if (!isTeacher) return; const noClassrooms = !state.teacherHasClassrooms, noStudents = !state.teacherHasStudents; document.querySelector('#risk-analysis-empty').textContent = noClassrooms ? 'No tienes aulas asignadas en esta institución.' : noStudents ? 'No hay estudiantes matriculados en tus aulas.' : 'No hay análisis de riesgo para estudiantes de tus aulas.'; document.querySelector('#early-alert-empty').textContent = noClassrooms ? 'No tienes aulas asignadas en esta institución.' : noStudents ? 'No hay estudiantes matriculados en tus aulas.' : 'No tienes alertas activas en tus aulas para los filtros seleccionados.'; document.querySelector('#closed-alerts-empty').textContent = noClassrooms ? 'No tienes aulas asignadas en esta institución.' : noStudents ? 'No hay estudiantes matriculados en tus aulas.' : 'No se encontraron alertas cerradas para estudiantes de tus aulas.'; }
+  async function refresh() { await loadData(); updateEmptyCopy(); renderIndicators(); renderAnalyses(); renderEarlyAlerts(); renderClosedAlerts(); }
   async function initialize() { try { await refresh(); initializeFilters(document.querySelector('#analysis-filters')); initializeFilters(document.querySelector('#early-alert-filters'), true); renderAnalyses(); renderEarlyAlerts(); state.loaded = true; } catch (error) { logError('Error al iniciar el módulo.', error); feedback('No se pudo cargar la información.', false); } finally { document.querySelector('#risk-analysis-loading').classList.add('d-none'); } }
 
+  const openAnalysisScoped = openAnalysis; openAnalysis = async (analysis) => { if (!authorizedAnalysis(analysis)) { denyAccess(); return; } await openAnalysisScoped(analysis); };
+  const openAlertDetailScoped = openAlertDetail; openAlertDetail = (alert) => { if (!authorizedAlert(alert)) { denyAccess(); return; } openAlertDetailScoped(alert); };
+  const openFollowupScoped = openFollowup; openFollowup = (alert = state.selectedAlert) => { if (!authorizedAlert(alert)) { denyAccess(); return; } openFollowupScoped(alert); };
   alertLink.addEventListener('click', showAlerts); document.querySelector('#dashboard-director .attention-link')?.addEventListener('click', showAlerts);[...menu.querySelectorAll('.nav-link')].filter((link) => link !== alertLink).forEach((link) => link.addEventListener('click', hideAlerts)); tabs.forEach((tab) => tab.addEventListener('click', () => activateTab(tab.dataset.alertsTab))); document.querySelector('#analysis-follow-up-button').addEventListener('click', () => openFollowup()); document.querySelector('#detail-follow-up-button').addEventListener('click', () => openFollowup()); document.querySelector('#detail-analysis-button').addEventListener('click', () => { detailModal.hide(); openAnalysis(state.selectedAnalysis); }); document.querySelector('#close-alert-button').addEventListener('click', closeAlert); document.querySelector('#follow-up-form').addEventListener('submit', saveFollowup);
+  document.querySelector('#risk-analysis-detail').addEventListener('click', (event) => { const target = event.target.closest('.attention-link'); if (!target || !state.selectedAlert) return; event.preventDefault(); if (!authorizedAlert(state.selectedAlert)) { denyAccess(); return; } window.previEduNavigation?.set('followups', { alertaId: state.selectedAlert.alerta_id }); analysisModal.hide(); [...menu.querySelectorAll('.nav-link')].find((item) => item.textContent.trim() === 'Seguimientos')?.click(); });
+  if (isTeacher) {
+    document.querySelector('#follow-up-form').addEventListener('submit', (event) => { if (!authorizedAlert(state.selectedAlert)) { event.preventDefault(); event.stopImmediatePropagation(); denyAccess(); } }, true);
+    document.querySelector('#close-alert-button').addEventListener('click', (event) => { if (!authorizedAlert(state.selectedAlert)) { event.preventDefault(); event.stopImmediatePropagation(); denyAccess(); } }, true);
+    window.addEventListener('previ:institution-change', async () => { state.loaded = false; state.selectedAnalysis = null; state.selectedAlert = null; state.authorizedEnrollmentIds.clear(); state.authorizedAlertIds.clear(); state.earlyPage = 1; state.closedPage = 1; analysisModal.hide(); detailModal.hide(); followupModal.hide(); window.previEduNavigation?.clear(); if (!view.classList.contains('d-none')) { try { await refresh(); resetFilterOptions(document.querySelector('#analysis-filters')); resetFilterOptions(document.querySelector('#early-alert-filters'), true); state.loaded = true; } catch (error) { logError('Error al cambiar de institución.', error); feedback('No se pudieron actualizar las alertas de la institución seleccionada.', false); } } });
+  }
 })();
